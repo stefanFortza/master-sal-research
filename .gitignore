@@ -1,0 +1,21 @@
+# Rust build artifacts
+target/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Operating system files
+.DS_Store
+Thumbs.db
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Temporary files
+*.log
+*.tmp

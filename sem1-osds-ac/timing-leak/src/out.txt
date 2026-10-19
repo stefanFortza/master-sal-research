@@ -1,0 +1,309 @@
+use std::arch::x86_64::{__rdtscp, _mm_lfence, _rdtsc};
+
+pub unsafe fn measure_cycles<F: FnOnce()>(f: F) -> u64 {
+    _mm_lfence(); // Asigură-te că toate instrucțiunile anterioare s-au terminat
+    let start = _rdtsc(); // Citește timestamp-ul de început
+
+    f(); // Execută funcția
+
+    _mm_lfence(); // Asigură-te că toate instrucțiunile din f() s-au terminat
+    let end = _rdtsc(); // Citește timestamp-ul de sfârșit
+    // end - start // Returnează diferența în cicluri
+    end.saturating_sub(start)
+}
+mod cycle_counter;
+mod statistics;
+mod victims;
+
+use std::{env, process};
+
+use cycle_counter::measure_cycles;
+use victims::constant_time_compare;
+
+use crate::victims::{constant_time_compare_naive, generate_samples};
+
+fn main() {
+    // args() returnează un iterator peste argumentele CLI (String)
+    let args: Vec<String> = env::args().collect();
+
+    // args[0] este întotdeauna calea binarului curent
+    if args.len() < 2 {
+        eprintln!("Use: {} <sample_count>", args[0]);
+        process::exit(1);
+    }
+
+    let sample_count = args[1].parse::<usize>().unwrap_or_else(|_| {
+        eprintln!(
+            "Invalid sample count: '{}' (must be a positive integer)",
+            args[1]
+        );
+        process::exit(1);
+    });
+
+    if sample_count == 0 {
+        eprintln!("Error: sample_count must be > 0");
+        process::exit(1);
+    }
+
+    println!("Running benchmark with {sample_count} samples...");
+
+    let sample_data = generate_samples(sample_count);
+    let mut accumulator_1 = statistics::WelfordAccumulator::new();
+    let mut accumulator_2 = statistics::WelfordAccumulator::new();
+    for (i, sample) in sample_data.iter().enumerate() {
+        let a = &sample.0;
+        let b = &sample.1;
+        let class_bit = rand::random::<u8>() % 2;
+
+        if class_bit == 0 {
+            unsafe {
+                let time = measure_cycles(|| {
+                    constant_time_compare(a, b);
+                });
+                accumulator_1.update(time as f64);
+            }
+        } else {
+            unsafe {
+                let time = measure_cycles(|| {
+                    constant_time_compare_naive(a, b);
+                });
+                accumulator_2.update(time as f64);
+            }
+        }
+    }
+
+    let result = statistics::calculate_welch_t(&accumulator_1, &accumulator_2).unwrap();
+    println!(
+        "Group 1: count = {}, mean = {:.2}, variance = {:.2}",
+        accumulator_1.count(),
+        accumulator_1.mean(),
+        accumulator_1.sample_variance()
+    );
+    println!(
+        "Group 2: count = {}, mean = {:.2}, variance = {:.2}",
+        accumulator_2.count(),
+        accumulator_2.mean(),
+        accumulator_2.sample_variance()
+    );
+    println!(
+        "Welch t-test result: t_value = {:.2}, degrees_of_freedom = {:.2}",
+        result.t_value, result.degrees_of_freedom
+    );
+    if result.has_leak() {
+        println!(
+            "Timing leak detected (|t| > {:.2})",
+            statistics::WelchTestResult::LEAK_THRESHOLD
+        );
+    } else {
+        println!(
+            "No timing leak detected (|t| <= {:.2})",
+            statistics::WelchTestResult::LEAK_THRESHOLD
+        );
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WelfordAccumulator {
+    count: u64,
+    mean: f64,
+    m2: f64,
+}
+
+impl Default for WelfordAccumulator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WelfordAccumulator {
+    #[inline]
+    pub const fn new() -> Self {
+        Self {
+            count: 0,
+            mean: 0.0,
+            m2: 0.0,
+        }
+    }
+
+    #[inline]
+    pub fn update(&mut self, sample: f64) {
+        self.count += 1;
+        let delta = sample - self.mean;
+        self.mean += delta / (self.count as f64);
+        let delta2 = sample - self.mean;
+        self.m2 += delta * delta2;
+    }
+
+    #[inline]
+    pub const fn count(&self) -> u64 {
+        self.count
+    }
+
+    #[inline]
+    pub const fn mean(&self) -> f64 {
+        self.mean
+    }
+
+    #[inline]
+    pub fn sample_variance(&self) -> f64 {
+        if self.count < 2 {
+            0.0
+        } else {
+            self.m2 / ((self.count - 1) as f64)
+        }
+    }
+
+    #[inline]
+    pub fn variance_of_mean(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.sample_variance() / (self.count as f64)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WelchTestResult {
+    pub t_value: f64,
+    pub degrees_of_freedom: f64,
+    pub count_a: u64,
+    pub count_b: u64,
+}
+
+impl WelchTestResult {
+    /// Pragul standard folosit în evaluarea constant-time (|t| > 4.5 indică leak)
+    pub const LEAK_THRESHOLD: f64 = 4.5;
+
+    #[inline]
+    pub fn has_leak(&self) -> bool {
+        self.t_value.abs() > Self::LEAK_THRESHOLD
+    }
+}
+
+/// Calculează testul Welch între clasa A (de ex. intrări fixe/valide) și clasa B (intrări aleatoare).
+pub fn calculate_welch_t(
+    group_a: &WelfordAccumulator,
+    group_b: &WelfordAccumulator,
+) -> Option<WelchTestResult> {
+    if group_a.count() < 2 || group_b.count() < 2 {
+        return None;
+    }
+
+    let var_a_mean = group_a.variance_of_mean();
+    let var_b_mean = group_b.variance_of_mean();
+    let denom = (var_a_mean + var_b_mean).sqrt();
+
+    // Dacă ambele seturi au varianță 0, nu există diferență
+    if denom == 0.0 || denom.is_nan() {
+        return Some(WelchTestResult {
+            t_value: 0.0,
+            degrees_of_freedom: 0.0,
+            count_a: group_a.count(),
+            count_b: group_b.count(),
+        });
+    }
+
+    let t = (group_a.mean() - group_b.mean()) / denom;
+
+    // Formula Welch–Satterthwaite pentru gradele de libertate
+    let num_df = (var_a_mean + var_b_mean).powi(2);
+    let den_df = (var_a_mean.powi(2) / ((group_a.count() - 1) as f64))
+        + (var_b_mean.powi(2) / ((group_b.count() - 1) as f64));
+
+    let df = if den_df > 0.0 { num_df / den_df } else { 0.0 };
+
+    Some(WelchTestResult {
+        t_value: t,
+        degrees_of_freedom: df,
+        count_a: group_a.count(),
+        count_b: group_b.count(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_welford_accuracy() {
+        let mut acc = WelfordAccumulator::new();
+        let samples = [10.0, 12.0, 23.0, 23.0, 16.0, 23.0, 21.0, 16.0];
+        for &s in &samples {
+            acc.update(s);
+        }
+
+        assert_eq!(acc.count(), 8);
+        assert!((acc.mean() - 18.0).abs() < 1e-9);
+        // Varianța eșantionului: 28.57142857...
+        assert!((acc.sample_variance() - 28.57142857142857).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_welch_leak_detection() {
+        let mut group_a = WelfordAccumulator::new();
+        let mut group_b = WelfordAccumulator::new();
+
+        // Două grupuri cu diferență mică de timp (simulare branch predict leak)
+        for _ in 0..10_000 {
+            group_a.update(100.0);
+            group_b.update(105.0);
+        }
+
+        let res = calculate_welch_t(&group_a, &group_b).unwrap();
+        // Deoarece varianța este practic nulă și media diferă, t-value explodează
+        assert!(res.has_leak());
+    }
+}
+use std::hint::black_box;
+
+pub fn constant_time_compare(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let a = black_box(a);
+    let b = black_box(b);
+
+    let mut accumulator: u8 = 0;
+
+    for i in 0..32 {
+        // XOR este 0 dacă octeții sunt identici, nenul dacă diferă.
+        // OR acumulează orice diferență fără a se opri niciodată.
+        accumulator |= a[i] ^ b[i];
+    }
+
+    // Întoarce true doar dacă accumulatorul a rămas strict 0.
+    black_box(accumulator == 0)
+}
+
+pub fn constant_time_compare_naive(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let a = black_box(a);
+    let b = black_box(b);
+
+    for i in 0..32 {
+        if a[i] != b[i] {
+            return false;
+        }
+    }
+
+    true
+}
+
+pub fn generate_samples(sample_count: usize) -> Vec<([u8; 32], [u8; 32])> {
+    let mut samples: Vec<([u8; 32], [u8; 32])> = Vec::with_capacity(sample_count);
+
+    for i in 0..sample_count {
+        let mut a = [0u8; 32];
+        let mut b = [0u8; 32];
+
+        let matching_first_bytes_count = rand::random_range(0..=32);
+
+        for j in 1..=matching_first_bytes_count {
+            a[j - 1] = rand::random::<u8>();
+            b[j - 1] = a[j - 1];
+        }
+        for j in matching_first_bytes_count..32 {
+            a[j] = rand::random::<u8>();
+            b[j] = rand::random::<u8>();
+        }
+
+        samples.push((a, b));
+    }
+    samples
+}
